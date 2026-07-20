@@ -1,0 +1,1185 @@
+<?php
+
+session_start();
+include("conn.php");
+
+// Mostrar todos los errores
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
+// ========== CONFIG ==========
+$MAX_TEAMS = 20;
+$is_local = in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1']);
+$REFERENCIA_PAGO = "BTC: 1A1z7agoat4FqCSDNiszMXcXaJBf2KMxJR"; // Referencia global de pago
+
+// ========== HELPERS ==========
+function safe_query($conn, $sql) {
+    $res = mysqli_query($conn, $sql);
+    if ($res === false) {
+        die("Error MySQL: " . mysqli_error($conn) . "<br><br>Consulta:<br>" . $sql);
+    }
+    return $res;
+}
+
+function safe_row($conn, $sql) {
+    $res = safe_query($conn, $sql);
+    if ($res === false) return null;
+    $row = mysqli_fetch_assoc($res);
+    return $row ?: null;
+}
+
+function safe_scalar($conn, $sql, $col = null) {
+    $row = safe_row($conn, $sql);
+    if ($row === null) return null;
+    return $col === null ? array_values($row)[0] : ($row[$col] ?? null);
+}
+
+// ========== QUICK-LOGIN (GET) ==========
+if (isset($_GET['quick']) && $is_local) {
+    $role = $_GET['quick'];
+
+    $stmt = $conn->prepare("SELECT id_usuario, nombre FROM usuarios WHERE rol = ? LIMIT 1");
+
+    if ($stmt) {
+        $stmt->bind_param("s", $role);
+        $stmt->execute();
+        $res = $stmt->get_result();
+
+        if ($user = $res->fetch_assoc()) {
+            $_SESSION['usuario_id'] = $user['id_usuario'];
+            $_SESSION['usuario_nombre'] = $user['nombre'];
+            $_SESSION['usuario_rol'] = $role;
+
+            header("Location: index.php?vista=" .
+                ($role === 'Juez'
+                    ? 'juez_panel'
+                    : ($role === 'Administrador'
+                        ? 'admin_panel'
+                        : 'invitado_panel')));
+
+            exit();
+        }
+    }
+
+    $_SESSION['usuario_id'] = 0;
+    $_SESSION['usuario_nombre'] = $role . " (temporal)";
+    $_SESSION['usuario_rol'] = $role;
+
+    header("Location: index.php?vista=" .
+        ($role === 'Juez'
+            ? 'juez_panel'
+            : ($role === 'Administrador'
+                ? 'admin_panel'
+                : 'invitado_panel')));
+
+    exit();
+}
+
+// ========== QUICK-LOGIN (POST buttons) ==========
+if (isset($_POST['quick_login']) && $is_local) {
+    $role = $_POST['role_quick'] ?? 'Invitado';
+    $stmt = $conn->prepare("SELECT id_usuario, nombre FROM usuarios WHERE rol = ? LIMIT 1");
+    if ($stmt) {
+        $stmt->bind_param("s", $role);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        if ($user = $res->fetch_assoc()) {
+            $_SESSION['usuario_id'] = $user['id_usuario'];
+            $_SESSION['usuario_nombre'] = $user['nombre'];
+            $_SESSION['usuario_rol'] = $role;
+            header("Location: index.php?vista=" . ($role === 'Juez' ? 'juez_panel' : ($role === 'Administrador' ? 'admin_panel' : 'invitado_panel')));
+            exit();
+        }
+    }
+    $_SESSION['usuario_id'] = 0;
+    $_SESSION['usuario_nombre'] = $role . " (temporal)";
+    $_SESSION['usuario_rol'] = $role;
+    header("Location: index.php?vista=" . ($role === 'Juez' ? 'juez_panel' : ($role === 'Administrador' ? 'admin_panel' : 'invitado_panel')));
+    exit();
+}
+
+// ========== VIEW STATE ==========
+$vista = $_GET['vista'] ?? 'r1_registro';
+$success = $error = $error_login = "";
+
+// ========== LOGIN / LOGOUT ==========
+if (isset($_POST['login'])) {
+    $correo = trim($_POST['correo'] ?? '');
+    $password = trim($_POST['password'] ?? '');
+    $stmt = $conn->prepare("SELECT id_usuario, nombre, rol, password FROM usuarios WHERE correo = ?");
+    if ($stmt) {
+        $stmt->bind_param("s", $correo);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        if ($user = $res->fetch_assoc()) {
+            if ($password === $user['password']) {
+                $_SESSION['usuario_id'] = $user['id_usuario'];
+                $_SESSION['usuario_nombre'] = $user['nombre'];
+                $_SESSION['usuario_rol'] = $user['rol'];
+                header("Location: index.php?vista=r2_perfil");
+                exit();
+            } else {
+                $error_login = "Contraseña incorrecta ❌";
+            }
+        } else {
+            $error_login = "El usuario no existe ❌";
+        }
+    } else {
+        $error_login = "Error en la consulta de login.";
+    }
+}
+if (isset($_GET['logout'])) {
+    session_destroy();
+    header("Location: index.php");
+    exit();
+}
+
+// ========== REGISTRO (public) - respetar rol elegido ==========
+if (isset($_POST['registrar_usuario'])) {
+    $rol_reg = $_POST['rol_reg'] ?? null;
+    $allowed = ['Participante', 'Invitado'];
+    if ($is_local) { $allowed[] = 'Juez'; $allowed[] = 'Administrador'; }
+    if ($rol_reg === null || !in_array($rol_reg, $allowed, true)) $rol_reg = 'Participante';
+
+    $nombre = trim($_POST['nombre'] ?? '');
+    $correo = trim($_POST['correo'] ?? '');
+    $password = trim($_POST['password'] ?? '');
+    $edad = intval($_POST['edad'] ?? 0);
+    $alergias = trim($_POST['alergias'] ?? '');
+    $datos_bancarios = '';
+
+    $foto = 'default_user.png';
+    if (isset($_FILES['foto_perfil']) && $_FILES['foto_perfil']['error'] === UPLOAD_ERR_OK) {
+        $foto = uniqid('user_', true) . '.' . pathinfo($_FILES['foto_perfil']['name'], PATHINFO_EXTENSION);
+        move_uploaded_file($_FILES['foto_perfil']['tmp_name'], 'imagenes/' . $foto);
+    }
+
+    $err = "";
+    if ($rol_reg === 'Participante') {
+        if ($edad < 15) $err = "❌ Debes tener mínimo 15 años para registrarte como participante.";
+        if (empty($nombre) || empty($correo) || empty($password)) $err = $err ? $err . " / Falta nombre/correo/contraseña." : "❌ Completa nombre, correo y contraseña.";
+    } elseif ($rol_reg === 'Invitado') {
+        if (empty($nombre) || empty($correo) || empty($password)) $err = "❌ Completa nombre, correo y contraseña.";
+    } elseif (in_array($rol_reg, ['Juez','Administrador'])) {
+        if (!$is_local) $err = "❌ No está permitido crear este rol desde aquí.";
+        if (empty($correo) || empty($password)) $err = "❌ Correo y contraseña obligatorios.";
+    }
+
+    if (empty($err)) {
+        $stmt = $conn->prepare("INSERT INTO usuarios (nombre, correo, password, foto_perfil, edad, alergias_alimentos, datos_bancarios, estatus_pago, rol) VALUES (?, ?, ?, ?, ?, ?, ?, 'Pendiente', ?)");
+        if ($stmt) {
+            $stmt->bind_param("ssssisss", $nombre, $correo, $password, $foto, $edad, $alergias, $datos_bancarios, $rol_reg);
+            if ($stmt->execute()) $success = "✅ Registro exitoso. ID: #" . $conn->insert_id;
+            else $error = "❌ Error al crear usuario: " . $stmt->error;
+            $stmt->close();
+        } else $error = "❌ Error al preparar la consulta: " . $conn->error;
+    } else $error = $err;
+}
+
+// ========== CREAR EQUIPO (hasta $MAX_TEAMS) ==========
+if (isset($_POST['registrar_equipo']) && isset($_SESSION['usuario_id'])) {
+    $res_count = mysqli_query($conn, "SELECT COUNT(*) as t FROM equipos");
+    $current = 0;
+    if ($res_count) {
+        $r = mysqli_fetch_assoc($res_count);
+        $current = intval($r['t'] ?? 0);
+    } else {
+        error_log("MySQL error counting equipos: " . mysqli_error($conn));
+        $current = 0;
+    }
+
+    if ($current >= $MAX_TEAMS) {
+        $error = "⚠️ Límite: Solo se permiten {$MAX_TEAMS} equipos. ❌";
+    } else {
+        $logo = 'default_team.png';
+        if (isset($_FILES['logo']) && $_FILES['logo']['error'] == 0) {
+            $logo = "team_" . time() . "." . pathinfo($_FILES['logo']['name'], PATHINFO_EXTENSION);
+            move_uploaded_file($_FILES['logo']['tmp_name'], "imagenes/" . $logo);
+        }
+        $nom_eq = trim($_POST['nombre_equipo'] ?? '');
+        $stmt = $conn->prepare("INSERT INTO equipos (nombre, logo, estatus) VALUES (?, ?, 'Activo')");
+        if ($stmt) {
+            $stmt->bind_param("ss", $nom_eq, $logo);
+            if ($stmt->execute()) $success = "✅ ¡Equipo creado exitosamente!";
+            else $error = "❌ Error al crear equipo: " . $stmt->error;
+            $stmt->close();
+        } else $error = "❌ Error al preparar la consulta de equipo: " . $conn->error;
+    }
+}
+
+// ========== ASIGNAR INTEGRANTE (cualquier usuario registrado) ==========
+if (isset($_POST['asignar_integrante'])) {
+    $id_eq = intval($_POST['id_equipo'] ?? 0);
+    $id_usr = intval($_POST['id_usuario'] ?? 0);
+    $rol_eq = trim($_POST['rol_en_equipo'] ?? 'Activo');
+    $limites = ['Activo' => 3, 'Banca' => 2, 'Reserva' => 1];
+
+    $stmtc = $conn->prepare("SELECT COUNT(*) as t FROM integrantes_equipos WHERE id_equipo = ? AND rol_en_equipo = ?");
+    if ($stmtc) {
+        $stmtc->bind_param("is", $id_eq, $rol_eq);
+        $stmtc->execute();
+        $cres = $stmtc->get_result()->fetch_assoc();
+        $actual = intval($cres['t'] ?? 0);
+        $stmtc->close();
+    } else $actual = 0;
+
+    if ($actual >= ($limites[$rol_eq] ?? 9999)) {
+        $error = "⚠️ Límite alcanzado para el rol '$rol_eq'. ❌";
+    } else {
+        $stmt = $conn->prepare("INSERT INTO integrantes_equipos (id_equipo, id_usuario, rol_en_equipo) VALUES (?, ?, ?)");
+        if ($stmt) {
+            $stmt->bind_param("iis", $id_eq, $id_usr, $rol_eq);
+            if ($stmt->execute()) $success = "✅ Integrante asignado correctamente.";
+            else $error = "❌ Error al asignar integrante: " . $stmt->error;
+            $stmt->close();
+        } else $error = "❌ Error al preparar la asignación: " . $conn->error;
+    }
+}
+
+// ========== REGISTRAR MATCH (Juez/Admin) ==========
+if (isset($_POST['registrar_match']) && isset($_SESSION['usuario_id'])) {
+
+    $eq1 = intval($_POST['equipo_1'] ?? 0);
+    $eq2 = intval($_POST['equipo_2'] ?? 0);
+    $p1 = intval($_POST['puntos_equipo_1'] ?? 0);
+    $p2 = intval($_POST['puntos_equipo_2'] ?? 0);
+    $motivo = trim($_POST['motivo_resultado'] ?? '');
+    $posted_resultado = $_POST['resultado_manual'] ?? 'auto';
+
+    if ($eq1 == $eq2) {
+        $error = "❌ Un equipo no puede jugar contra sí mismo.";
+    } else {
+        $admin_only = ['eq1_gana','eq2_gana','descalificar_eq1','descalificar_eq2'];
+
+        $resultado_manual = (
+            in_array($posted_resultado, $admin_only) &&
+            ($_SESSION['usuario_rol'] ?? '') != 'Administrador'
+        ) ? 'auto' : $posted_resultado;
+
+        $ganador = null;
+        $perdedor = null;
+        $estatus = "Empate";
+
+        if ($resultado_manual == "eq1_gana") {
+            $ganador = $eq1;
+            $perdedor = $eq2;
+            $estatus = "Ganador";
+        } elseif ($resultado_manual == "eq2_gana") {
+            $ganador = $eq2;
+            $perdedor = $eq1;
+            $estatus = "Ganador";
+        } elseif ($resultado_manual == "empate") {
+            $estatus = "Empate";
+        } elseif ($resultado_manual == "descalificar_eq1") {
+            $ganador = $eq2;
+            $perdedor = $eq1;
+            $estatus = "Descalificado";
+        } elseif ($resultado_manual == "descalificar_eq2") {
+            $ganador = $eq1;
+            $perdedor = $eq2;
+            $estatus = "Descalificado";
+        } else {
+            if ($p1 > $p2) {
+                $ganador = $eq1;
+                $perdedor = $eq2;
+                $estatus = "Ganador";
+            } elseif ($p2 > $p1) {
+                $ganador = $eq2;
+                $perdedor = $eq1;
+                $estatus = "Ganador";
+            } else {
+                $estatus = "Empate";
+            }
+        }
+
+        $stmt = $conn->prepare("
+            INSERT INTO matches
+            (
+                id_equipo_1,
+                id_equipo_2,
+                puntos_equipo_1,
+                puntos_equipo_2,
+                id_ganador,
+                id_perdedor,
+                id_juez,
+                motivo_resultado,
+                estatus_resultado,
+                fecha
+            )
+            VALUES
+            (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW()
+            )
+        ");
+
+        if ($stmt) {
+            $id_ganador = $ganador;
+            $id_perdedor = $perdedor;
+            $id_juez = intval($_SESSION['usuario_id']);
+
+            $stmt->bind_param(
+                "iiiiiiiss",
+                $eq1,
+                $eq2,
+                $p1,
+                $p2,
+                $id_ganador,
+                $id_perdedor,
+                $id_juez,
+                $motivo,
+                $estatus
+            );
+
+            if ($stmt->execute()) {
+                $success = "✅ Encuentro registrado correctamente.";
+            } else {
+                $error = "❌ Error al registrar: " . $stmt->error;
+            }
+
+            $stmt->close();
+        } else {
+            $error = "❌ Error al preparar la consulta: " . $conn->error;
+        }
+    }
+}
+
+// ========== MODIFICAR PUNTAJE DE MATCH (Juez) ==========
+if (isset($_POST['modificar_match']) && ($_SESSION['usuario_rol'] ?? '') === 'Juez') {
+    $id_match = intval($_POST['id_match'] ?? 0);
+    $p1 = intval($_POST['puntos_mod_1'] ?? 0);
+    $p2 = intval($_POST['puntos_mod_2'] ?? 0);
+    
+    $stmt = $conn->prepare("UPDATE matches SET puntos_equipo_1 = ?, puntos_equipo_2 = ? WHERE id = ?");
+    if ($stmt) {
+        $stmt->bind_param("iii", $p1, $p2, $id_match);
+        if ($stmt->execute()) $success = "✅ Puntaje actualizado.";
+        else $error = "❌ Error al actualizar: " . $stmt->error;
+        $stmt->close();
+    }
+}
+
+// ========== APROBAR/RECHAZAR PAGOS (Admin) ==========
+if (isset($_POST['aprobar_pago']) && ($_SESSION['usuario_rol'] ?? '') === 'Administrador') {
+    $id_pago = intval($_POST['id_usuario_pago']);
+    $stmt = $conn->prepare("UPDATE usuarios SET estatus_pago = 'Aprobado' WHERE id_usuario = ?");
+    if ($stmt) { 
+        $stmt->bind_param("i", $id_pago); 
+        if ($stmt->execute()) $success = "✅ Pago aprobado."; 
+        else $error = "❌ Error: " . $stmt->error; 
+        $stmt->close(); 
+    }
+}
+if (isset($_POST['rechazar_pago']) && ($_SESSION['usuario_rol'] ?? '') === 'Administrador') {
+    $id_pago = intval($_POST['id_usuario_pago']);
+    $stmt = $conn->prepare("UPDATE usuarios SET estatus_pago = 'Pendiente' WHERE id_usuario = ?");
+    if ($stmt) { 
+        $stmt->bind_param("i", $id_pago); 
+        if ($stmt->execute()) $success = "⚠️ Pago rechazado."; 
+        else $error = "❌ Error: " . $stmt->error; 
+        $stmt->close(); 
+    }
+}
+
+// ========== MODIFICAR REFERENCIA BANCARIA (Admin) ==========
+if (isset($_POST['actualizar_ref_bancaria']) && ($_SESSION['usuario_rol'] ?? '') === 'Administrador') {
+    $id_usuario = intval($_POST['id_usuario_ref'] ?? 0);
+    $nueva_ref = trim($_POST['nueva_ref_bancaria'] ?? '');
+    
+    if (!empty($nueva_ref)) {
+        $stmt = $conn->prepare("UPDATE usuarios SET datos_bancarios = ? WHERE id_usuario = ?");
+        if ($stmt) {
+            $stmt->bind_param("si", $nueva_ref, $id_usuario);
+            if ($stmt->execute()) $success = "✅ Referencia bancaria actualizada.";
+            else $error = "❌ Error al actualizar: " . $stmt->error;
+            $stmt->close();
+        }
+    } else {
+        $error = "❌ La referencia bancaria no puede estar vacía.";
+    }
+}
+
+// ========== ADMIN: ajustar puntos, ban/unban ==========
+if (isset($_POST['ajustar_puntos']) && ($_SESSION['usuario_rol'] ?? '') == 'Administrador') {
+    $id_eq = intval($_POST['id_equipo_puntos'] ?? 0);
+    $delta = intval($_POST['delta_puntos'] ?? 0);
+    $stmt = $conn->prepare("UPDATE equipos SET puntos_extra = COALESCE(puntos_extra,0) + ? WHERE id = ?");
+    if ($stmt) { $stmt->bind_param("ii", $delta, $id_eq); if ($stmt->execute()) $success = "✅ Puntos ajustados."; else $error = $stmt->error; $stmt->close(); }
+}
+if (isset($_POST['banear_equipo_admin']) && ($_SESSION['usuario_rol'] ?? '') == 'Administrador') {
+    $id_eq = intval($_POST['id_equipo_banear_admin'] ?? 0);
+    $stmt = $conn->prepare("UPDATE equipos SET estatus = 'Baneado' WHERE id = ?");
+    if ($stmt) { $stmt->bind_param("i", $id_eq); if ($stmt->execute()) $success = "⛔ Equipo baneado."; else $error = $stmt->error; $stmt->close(); }
+}
+if (isset($_POST['desbanear_equipo_admin']) && ($_SESSION['usuario_rol'] ?? '') == 'Administrador') {
+    $id_eq = intval($_POST['id_equipo_desbanear_admin'] ?? 0);
+    $stmt = $conn->prepare("UPDATE equipos SET estatus = 'Activo' WHERE id = ?");
+    if ($stmt) { $stmt->bind_param("i", $id_eq); if ($stmt->execute()) $success = "✅ Equipo desbaneado."; else $error = $stmt->error; $stmt->close(); }
+}
+
+// ========== Helper imagen ==========
+function obtenerRutaImagen($img) {
+    if (empty($img) || $img === '0') return "imagenes/default_user.png";
+    $clean = str_replace('imagenes/', '', $img);
+    return "imagenes/" . $clean;
+}
+
+// ========== HTML VIEW ==========
+?><!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Arena de Competencia</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box}body{font-family:Segoe UI, Tahoma, Arial;background:linear-gradient(135deg,#0f172a,#1a1f2e);color:#f1f5f9;margin:0}
+nav{background:#1e293b;padding:12px;border-bottom:3px solid #facc15;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+nav a{color:#94a3b8;text-decoration:none;padding:6px 12px;border-radius:6px}
+nav a.active,nav a:hover{color:#facc15;background:rgba(250,204,21,0.06)}
+.container{max-width:1400px;margin:24px auto;padding:0 16px}
+.card{background:linear-gradient(135deg,#1e293b,#0f172a);border:2px solid #3b82f6;border-radius:12px;padding:22px;margin-bottom:22px}
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}
+.box{background:linear-gradient(135deg,#0f172a,#1a1f2e);border:2px solid #334155;border-radius:10px;padding:16px;margin-bottom:10px}
+.box-title{font-weight:bold;color:#facc15;margin-bottom:12px;font-size:1.1em}
+.flex{display:flex;gap:20px;flex-wrap:wrap}
+.flex-child{flex:1;min-width:280px}
+input,select,textarea,button{width:100%;padding:10px;border-radius:8px;background:#0f172a;border:2px solid #475569;color:#fff;margin:8px 0}
+button{cursor:pointer;background:linear-gradient(135deg,#3b82f6,#2563eb);font-weight:bold;transition:0.3s}
+button:hover{background:linear-gradient(135deg,#2563eb,#1d4ed8)}
+.btn-quick{display:inline-block;padding:8px 12px;border-radius:6px;margin:4px;background:#64748b;color:#fff;text-decoration:none}
+.success{background:linear-gradient(135deg,#10b981,#34d399);padding:12px;border-radius:8px;color:#fff;margin-bottom:10px}
+.error{background:linear-gradient(135deg,#ef4444,#f87171);padding:12px;border-radius:8px;color:#fff;margin-bottom:10px}
+.match-card{background:#0f172a;padding:14px;border-radius:8px;margin-bottom:12px;border:1px solid #263344}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+table th{background:#0f172a;color:#facc15;padding:12px;text-align:left;border-bottom:2px solid #3b82f6}
+table td{padding:12px;border-bottom:1px solid #233142}
+table tr:hover{background:rgba(59,130,246,0.05)}
+.status-aprobado{background:#10b981;color:#fff;padding:6px 12px;border-radius:6px;display:inline-block}
+.status-pendiente{background:#f59e0b;color:#fff;padding:6px 12px;border-radius:6px;display:inline-block}
+.status-rechazado{background:#ef4444;color:#fff;padding:6px 12px;border-radius:6px;display:inline-block}
+.logo-container{display:inline-flex;align-items:center;justify-content:center;border-radius:8px;border:2px solid #3b82f6;background:#0f172a;overflow:hidden}
+.logo-container img{width:100%;height:100%;object-fit:cover}
+.team-player-card{background:rgba(59,130,246,0.1);border:1px solid #3b82f6;border-radius:8px;padding:10px;text-align:center;margin-bottom:10px}
+.team-player-card img{width:60px;height:60px;border-radius:50%;object-fit:cover;border:2px solid #3b82f6;margin-bottom:8px}
+.player-badge{display:inline-block;padding:4px 8px;border-radius:6px;font-size:0.75em;margin-top:4px;font-weight:bold}
+.badge-activo{background:#3b82f6;color:#fff}
+.badge-banca{background:#f59e0b;color:#fff}
+.badge-reserva{background:#8b5cf6;color:#fff}
+.nav-section{background:rgba(59,130,246,0.1);border:1px solid #3b82f6;border-radius:6px;padding:8px 12px;display:inline-flex;align-items:center;gap:8px}
+.bank-ref-container{background:rgba(250,204,21,0.1);border:2px solid #facc15;border-radius:8px;padding:12px;margin-top:12px;min-height:50px;display:flex;align-items:center;justify-content:space-between}
+.bank-ref-label{color:#94a3b8;font-size:0.9em;margin-bottom:4px}
+.bank-ref-value{color:#facc15;font-weight:bold;font-size:1.1em;word-break:break-all}
+.payment-instruction{background:rgba(16,185,129,0.1);border:2px solid #10b981;border-radius:8px;padding:16px;margin:16px 0}
+.payment-ref{background:#0f172a;border:2px solid #facc15;border-radius:8px;padding:14px;margin:12px 0;text-align:center}
+.payment-ref-label{color:#94a3b8;font-size:0.9em;margin-bottom:6px}
+.payment-ref-code{color:#facc15;font-weight:bold;font-size:1.2em;font-family:monospace;word-break:break-all;padding:10px;background:rgba(15,23,42,0.8);border-radius:6px;margin:10px 0}
+.copy-btn{width:auto;padding:8px 12px;margin:8px 0;display:inline-block}
+</style>
+</head>
+<body>
+<nav>
+    <a href="index.php?vista=r1_registro" class="<?= $vista=='r1_registro'?'active':'' ?>">🔑 ACCESO</a>
+    <a href="index.php?vista=r3_competencia" class="<?= $vista=='r3_competencia'?'active':'' ?>">⚔️ TABLA</a>
+    <a href="index.php?vista=ver_matches" class="<?= $vista=='ver_matches'?'active':'' ?>">📊 RESULTADOS</a>
+    <a href="index.php?vista=ver_equipos_jugadores" class="<?= $vista=='ver_equipos_jugadores'?'active':'' ?>">👥 EQUIPOS</a>
+    <?php if (isset($_SESSION['usuario_id'])): ?><a href="index.php?vista=r2_perfil" class="<?= $vista=='r2_perfil'?'active':'' ?>">👤 MI PERFIL</a><?php endif; ?>
+    <?php if (isset($_SESSION['usuario_rol']) && $_SESSION['usuario_rol']=='Participante'): ?><a href="index.php?vista=pagar" class="<?= $vista=='pagar'?'active':'' ?>" style="color:#10b981">💳 PAGAR INSCRIPCIÓN</a><?php endif; ?>
+    <?php if (isset($_SESSION['usuario_rol']) && $_SESSION['usuario_rol']=='Juez'): ?><a href="index.php?vista=juez_panel" class="<?= $vista=='juez_panel'?'active':'' ?>" style="color:#f97316">⚖️ ÁRBITRO</a><?php endif; ?>
+    <?php if (isset($_SESSION['usuario_rol']) && $_SESSION['usuario_rol']=='Administrador'): ?><a href="index.php?vista=admin_panel" class="<?= $vista=='admin_panel'?'active':'' ?>" style="color:#a855f7">🔧 ADMIN</a><?php endif; ?>
+    <?php if (isset($_SESSION['usuario_rol']) && $_SESSION['usuario_rol']=='Administrador'): ?><a href="index.php?vista=admin_pagos" class="<?= $vista=='admin_pagos'?'active':'' ?>" style="color:#10b981">💰 PAGOS</a><?php endif; ?>
+    <?php if (isset($_SESSION['usuario_id'])): ?><a href="index.php?logout=true" style="margin-left:20px;color:#ef4444">🚪 SALIR</a><?php endif; ?>
+</nav>
+
+<div class="container">
+    <?php if ($success) echo "<div class='success'>$success</div>"; ?>
+    <?php if ($error) echo "<div class='error'>$error</div>"; ?>
+
+    <!-- R1: Registro / Acceso -->
+    <?php if ($vista == 'r1_registro'): ?>
+        <div class="card flex">
+            <div class="flex-child">
+                <h3 style="text-align:center">🔐 INGRESAR</h3>
+                <?php if ($error_login) echo "<div class='error'>$error_login</div>"; ?>
+                <form action="index.php?vista=r1_registro" method="POST">
+                    <input type="email" name="correo" placeholder="Correo" required>
+                    <input type="password" name="password" placeholder="Contraseña" required>
+                    <button type="submit" name="login">🚀 ENTRAR</button>
+                </form>
+
+                <?php if ($is_local): ?>
+                    <div style="text-align:center;margin-top:8px;">
+                        <form action="index.php?vista=r1_registro" method="POST" style="display:inline-block"><input type="hidden" name="role_quick" value="Invitado"><button type="submit" name="quick_login" style="width:auto;padding:8px 12px">🟢 Inv</button></form>
+                        <form action="index.php?vista=r1_registro" method="POST" style="display:inline-block"><input type="hidden" name="role_quick" value="Juez"><button type="submit" name="quick_login" style="width:auto;padding:8px 12px">⚖️ Juez</button></form>
+                        <form action="index.php?vista=r1_registro" method="POST" style="display:inline-block"><input type="hidden" name="role_quick" value="Administrador"><button type="submit" name="quick_login" style="width:auto;padding:8px 12px">🔧 Admin</button></form>
+                        <p style="color:#94a3b8;font-size:0.85em">(Acceso rápido solo en local)</p>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="flex-child" style="border-left:2px solid #334155;padding-left:18px;">
+                <h3 style="text-align:center">📝 INSCRIPCIÓN</h3>
+                <form id="form_registro" action="index.php?vista=r1_registro" method="POST" enctype="multipart/form-data">
+                    <input type="text" name="nombre" placeholder="Nombre Completo" id="fld_nombre">
+                    <input type="email" name="correo" placeholder="Correo" required id="fld_correo">
+
+                    <label>Registrarse como</label>
+                    <select name="rol_reg" id="rol_reg">
+                        <option value="Participante">Participante</option>
+                        <option value="Invitado">Invitado</option>
+                        <?php if ($is_local): ?><option value="Juez">Juez</option><option value="Administrador">Administrador</option><?php endif; ?>
+                    </select>
+
+                    <input type="password" name="password" placeholder="Contraseña" required id="fld_password">
+                    <input type="number" name="edad" placeholder="Edad (min. 15)" min="0" id="fld_edad">
+                    <input type="text" name="alergias" placeholder="Alergias Alimenticias" id="fld_alergias">
+
+                    <label>Foto de Perfil</label>
+                    <input type="file" name="foto_perfil" accept="image/*">
+
+                    <button type="submit" name="registrar_usuario">✅ Registrarse</button>
+                </form>
+
+                <script>
+                (function(){
+                    const rol = document.getElementById('rol_reg');
+                    const fldEdad = document.getElementById('fld_edad');
+                    const fldNombre = document.getElementById('fld_nombre');
+                    const fldAlergias = document.getElementById('fld_alergias');
+
+                    function actualizar() {
+                        const r = rol.value;
+                        if (r === 'Participante') {
+                            fldEdad.required = true;
+                            fldNombre.style.display = 'block';
+                            fldAlergias.style.display = 'block';
+                        } else if (r === 'Invitado') {
+                            fldEdad.required = false;
+                            fldNombre.style.display = 'block';
+                            fldAlergias.style.display = 'block';
+                        } else if (r === 'Juez' || r === 'Administrador') {
+                            fldEdad.required = false;
+                            fldNombre.style.display = 'none';
+                            fldAlergias.style.display = 'none';
+                        } else {
+                            fldEdad.required = false;
+                        }
+                    }
+                    rol.addEventListener('change', actualizar);
+                    actualizar();
+                })();
+                </script>
+            </div>
+        </div>
+
+        <!-- Lista pública de equipos -->
+        <div class="card">
+            <h2>🛡️ Equipos Registrados</h2>
+            <?php
+            $teams = safe_query($conn, "SELECT id, nombre, logo, estatus, COALESCE(puntos_extra,0) as puntos_extra FROM equipos ORDER BY nombre");
+            if ($teams && mysqli_num_rows($teams) > 0) {
+                echo '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-top:16px">';
+                while ($t = mysqli_fetch_assoc($teams)) {
+                    $logo_path = (!empty($t['logo']) && $t['logo'] !== 'default_team.png') ? 'imagenes/' . htmlspecialchars($t['logo']) : 'imagenes/default_team.png';
+                    echo '<div class="box" style="text-align:center">';
+                    echo '<div class="logo-container" style="margin:0 auto 8px;width:100%;height:120px;display:flex;align-items:center;justify-content:center;">';
+                    echo '<img src="'.htmlspecialchars($logo_path).'" alt="'.htmlspecialchars($t['nombre']).'" onerror="this.src=\'imagenes/default_team.png\'" style="width:100%;height:100%;object-fit:cover">';
+                    echo '</div>';
+                    echo '<div style="font-weight:bold;color:#facc15">'.htmlspecialchars($t['nombre']).'</div>';
+                    echo '<div style="color:#94a3b8;margin-top:6px;font-size:0.9em">Extra: '.intval($t['puntos_extra']).' pts</div>';
+                    echo '<div style="margin-top:6px"><span style="background:'.($t['estatus']=='Baneado' ? '#ef4444' : '#10b981').';padding:4px 8px;border-radius:6px;color:#fff;font-size:0.85em;">'.htmlspecialchars($t['estatus']).'</span></div>';
+                    echo '</div>';
+                }
+                echo '</div>';
+            } else {
+                echo '<p style="color:#94a3b8;margin-top:16px">Aún no hay equipos creados.</p>';
+            }
+            ?>
+        </div>
+
+        <!-- Panel público de pagos -->
+        <div class="card" style="margin-top:18px;">
+            <h2>💰 Estado de Pagos (participantes)</h2>
+            <?php
+            $pags = safe_query($conn, "SELECT id_usuario, nombre, correo, edad, COALESCE(alergias_alimentos,'') as alergias_alimentos, estatus_pago FROM usuarios WHERE rol = 'Participante' ORDER BY estatus_pago DESC");
+            if ($pags && mysqli_num_rows($pags) > 0) {
+                echo '<table><thead><tr><th>#</th><th>Nombre</th><th>Correo</th><th>Edad</th><th>Alergias</th><th>Estatus Pago</th></tr></thead><tbody>';
+                while ($u = mysqli_fetch_assoc($pags)) {
+                    echo '<tr>';
+                    echo '<td>#'.intval($u['id_usuario']).'</td>';
+                    echo '<td>'.htmlspecialchars($u['nombre']).'</td>';
+                    echo '<td>'.htmlspecialchars($u['correo']).'</td>';
+                    echo '<td>'.intval($u['edad']).'</td>';
+                    echo '<td>'.htmlspecialchars($u['alergias_alimentos']).'</td>';
+                    echo '<td><span class="status-'.strtolower($u['estatus_pago']).'">'.htmlspecialchars($u['estatus_pago']).'</span></td>';
+                    echo '</tr>';
+                }
+                echo '</tbody></table>';
+            } else {
+                echo '<p style="color:#94a3b8;margin-top:16px">No hay participantes con registro de pago.</p>';
+            }
+            ?>
+        </div>
+
+    <?php endif; ?>
+
+    <!-- ========== PAGAR INSCRIPCIÓN (Participante) ========== -->
+    <?php if ($vista == 'pagar' && isset($_SESSION['usuario_id']) && ($_SESSION['usuario_rol'] ?? '') === 'Participante'): ?>
+        <div class="card">
+            <h2>💳 PAGAR INSCRIPCIÓN</h2>
+            <?php
+            $id_usr = intval($_SESSION['usuario_id']);
+            $perfil_pago = safe_row($conn, "SELECT id_usuario, nombre, correo, estatus_pago FROM usuarios WHERE id_usuario = $id_usr");
+            if ($perfil_pago) {
+                echo '<div class="box">';
+                echo '<div style="display:flex;gap:20px;flex-wrap:wrap">';
+                
+                echo '<div class="flex-child">';
+                echo '<h3 style="color:#facc15;margin-top:0">📋 TUS DATOS</h3>';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">Nombre:</span> <span style="color:#f1f5f9;font-weight:bold">'.htmlspecialchars($perfil_pago['nombre']).'</span></div>';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">Correo:</span> <span style="color:#f1f5f9">'.htmlspecialchars($perfil_pago['correo']).'</span></div>';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">Estado:</span> <span class="status-'.strtolower($perfil_pago['estatus_pago']).'">'.htmlspecialchars($perfil_pago['estatus_pago']).'</span></div>';
+                echo '</div>';
+                
+                echo '<div class="flex-child">';
+                echo '<h3 style="color:#facc15;margin-top:0">💰 INFORMACIÓN DE PAGO</h3>';
+                
+                if ($perfil_pago['estatus_pago'] === 'Aprobado') {
+                    echo '<div class="payment-instruction">';
+                    echo '<div style="color:#10b981;font-weight:bold;font-size:1.1em;margin-bottom:8px">✅ ¡PAGO APROBADO!</div>';
+                    echo '<p style="color:#10b981">Tu inscripción ha sido confirmada. ¡Bienvenido a la competencia!</p>';
+                    echo '</div>';
+                } elseif ($perfil_pago['estatus_pago'] === 'Pendiente') {
+                    echo '<div class="payment-instruction">';
+                    echo '<p style="color:#10b981">Para completar tu inscripción, realiza un pago a la siguiente referencia:</p>';
+                    echo '</div>';
+                    
+                    echo '<div class="payment-ref">';
+                    echo '<div class="payment-ref-label">🔐 REFERENCIA DE PAGO</div>';
+                    echo '<div class="payment-ref-code">'.htmlspecialchars($REFERENCIA_PAGO).'</div>';
+                    echo '<button class="copy-btn" onclick="copiarAlPortapapeles()">📋 Copiar Referencia</button>';
+                    echo '</div>';
+                    
+                    echo '<div style="background:rgba(59,130,246,0.1);border:1px solid #3b82f6;border-radius:8px;padding:12px;margin:12px 0">';
+                    echo '<h4 style="color:#3b82f6;margin-top:0">📝 Instrucciones:</h4>';
+                    echo '<ol style="color:#94a3b8;margin:8px 0">';
+                    echo '<li>Copia la referencia de pago anterior</li>';
+                    echo '<li>Realiza la transferencia usando tu plataforma de pago favorita</li>';
+                    echo '<li>Asegúrate de incluir esta referencia en el concepto de la transferencia</li>';
+                    echo '<li>El administrador revisará y aprobará tu pago</li>';
+                    echo '<li>Recibirás una confirmación cuando se complete</li>';
+                    echo '</ol>';
+                    echo '</div>';
+                } else {
+                    echo '<div style="background:rgba(239,68,68,0.1);border:2px solid #ef4444;border-radius:8px;padding:12px">';
+                    echo '<div style="color:#ef4444;font-weight:bold">⚠️ Pago Rechazado</div>';
+                    echo '<p style="color:#ef4444;margin-bottom:0">Por favor, contacta con los administradores para más información.</p>';
+                    echo '</div>';
+                }
+                
+                echo '</div>';
+                echo '</div>';
+                echo '</div>';
+            }
+            ?>
+        </div>
+
+    <?php endif; ?>
+
+    <!-- ========== R2: MI PERFIL ========== -->
+    <?php if ($vista == 'r2_perfil' && isset($_SESSION['usuario_id'])): ?>
+        <div class="card">
+            <h2>👤 MI PERFIL</h2>
+            <?php
+            $id_usr = intval($_SESSION['usuario_id']);
+            $perfil = safe_row($conn, "SELECT id_usuario, nombre, correo, edad, foto_perfil, alergias_alimentos, datos_bancarios, estatus_pago, rol FROM usuarios WHERE id_usuario = $id_usr");
+            if ($perfil) {
+                $foto_path = obtenerRutaImagen($perfil['foto_perfil']);
+                echo '<div class="flex">';
+                echo '<div class="flex-child" style="max-width:180px">';
+                echo '<img src="'.htmlspecialchars($foto_path).'" alt="Perfil" onerror="this.src=\'imagenes/default_user.png\'" style="width:100%;border-radius:12px;border:2px solid #3b82f6;margin-bottom:12px">';
+                echo '<button onclick="alert(\'Actualización de perfil próximamente\')" style="background:linear-gradient(135deg,#8b5cf6,#7c3aed)">✏️ Editar Perfil</button>';
+                echo '</div>';
+                echo '<div class="flex-child">';
+                echo '<div class="box">';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">ID:</span> <span style="color:#facc15;font-weight:bold">#' . intval($perfil['id_usuario']) . '</span></div>';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">Nombre:</span> <span style="color:#f1f5f9;font-weight:bold">' . htmlspecialchars($perfil['nombre']) . '</span></div>';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">Correo:</span> <span style="color:#f1f5f9">' . htmlspecialchars($perfil['correo']) . '</span></div>';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">Edad:</span> <span style="color:#f1f5f9">' . intval($perfil['edad']) . ' años</span></div>';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">Rol:</span> <span style="color:#facc15;font-weight:bold">' . htmlspecialchars($perfil['rol']) . '</span></div>';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">Alergias:</span> <span style="color:#f1f5f9">' . (empty($perfil['alergias_alimentos']) ? 'Ninguna registrada' : htmlspecialchars($perfil['alergias_alimentos'])) . '</span></div>';
+                echo '<div style="margin-bottom:12px"><span style="color:#94a3b8">Estado Pago:</span> <span class="status-'.strtolower($perfil['estatus_pago']).'">' . htmlspecialchars($perfil['estatus_pago']) . '</span></div>';
+                echo '</div>';
+                
+                if (!empty($perfil['datos_bancarios'])) {
+                    echo '<div class="bank-ref-container">';
+                    echo '<div>';
+                    echo '<div class="bank-ref-label">💳 REFERENCIA BANCARIA</div>';
+                    echo '<div class="bank-ref-value">' . htmlspecialchars($perfil['datos_bancarios']) . '</div>';
+                    echo '</div>';
+                    echo '</div>';
+                } else {
+                    echo '<div class="bank-ref-container" style="background:rgba(239,68,68,0.1);border-color:#ef4444">';
+                    echo '<div>';
+                    echo '<div class="bank-ref-label" style="color:#ef4444">⚠️ SIN REFERENCIA BANCARIA</div>';
+                    echo '<div class="bank-ref-value" style="color:#ef4444">No registrada</div>';
+                    echo '</div>';
+                    echo '</div>';
+                }
+                echo '</div>';
+                echo '</div>';
+            } else {
+                echo '<p style="color:#ef4444">Error: No se encontró el perfil.</p>';
+            }
+            ?>
+        </div>
+
+        <!-- Mis equipos -->
+        <div class="card">
+            <h2>⚔️ MIS EQUIPOS</h2>
+            <?php
+            $mis_equipos = safe_query($conn, "
+                SELECT DISTINCT e.id, e.nombre, e.logo, e.estatus, COUNT(ie.id_usuario) as total_jugadores
+                FROM equipos e
+                LEFT JOIN integrantes_equipos ie ON e.id = ie.id_equipo
+                WHERE e.id IN (SELECT id_equipo FROM integrantes_equipos WHERE id_usuario = $id_usr)
+                GROUP BY e.id
+                ORDER BY e.nombre
+            ");
+            if ($mis_equipos && mysqli_num_rows($mis_equipos) > 0) {
+                while ($eq = mysqli_fetch_assoc($mis_equipos)) {
+                    $logo_path = obtenerRutaImagen($eq['logo']);
+                    echo '<div class="box">';
+                    echo '<div style="display:flex;gap:15px;margin-bottom:12px">';
+                    echo '<div class="logo-container" style="width:70px;height:70px;flex-shrink:0">';
+                    echo '<img src="'.htmlspecialchars($logo_path).'" alt="' . htmlspecialchars($eq['nombre']) . '" onerror="this.src=\'imagenes/default_team.png\'" style="width:100%;height:100%;object-fit:cover">';
+                    echo '</div>';
+                    echo '<div style="flex:1">';
+                    echo '<h3 style="margin:0;color:#facc15">' . htmlspecialchars($eq['nombre']) . '</h3>';
+                    echo '<div style="color:#94a3b8;font-size:0.9em">Jugadores: ' . intval($eq['total_jugadores']) . ' | Estado: <span style="color:'.($eq['estatus']=='Activo'?'#10b981':'#ef4444').'">' . htmlspecialchars($eq['estatus']) . '</span></div>';
+                    echo '</div>';
+                    echo '</div>';
+                }
+            } else {
+                echo '<p style="color:#94a3b8">No eres miembro de ningún equipo aún.</p>';
+            }
+            ?>
+        </div>
+
+    <?php endif; ?>
+
+    <!-- ========== VER EQUIPOS Y JUGADORES ========== -->
+    <?php if ($vista == 'ver_equipos_jugadores'): ?>
+        <div class="card">
+            <h2>👥 EQUIPOS Y SUS JUGADORES</h2>
+            
+            <?php
+            $equipos = safe_query($conn, "SELECT id, nombre, logo, estatus FROM equipos ORDER BY nombre");
+            if ($equipos && mysqli_num_rows($equipos) > 0) {
+                while ($equipo = mysqli_fetch_assoc($equipos)) {
+                    $id_equipo = $equipo['id'];
+                    $nombre_equipo = htmlspecialchars($equipo['nombre']);
+                    $logo_path = obtenerRutaImagen($equipo['logo']);
+                    $estatus = $equipo['estatus'];
+                    $color_estatus = ($estatus == 'Baneado') ? '#ef4444' : '#10b981';
+                    
+                    echo '<div class="box" style="margin-bottom:20px;padding:20px">';
+                    
+                    // Header del equipo
+                    echo '<div style="display:flex;align-items:center;gap:20px;margin-bottom:20px;border-bottom:2px solid #334155;padding-bottom:20px;">';
+                    echo '<div class="logo-container" style="width:90px;height:90px;display:flex;align-items:center;justify-content:center;flex-shrink:0;">';
+                    echo '<img src="'.htmlspecialchars($logo_path).'" alt="'.$nombre_equipo.'" onerror="this.src=\'imagenes/default_team.png\'" style="width:100%;height:100%;object-fit:cover;border-radius:8px">';
+                    echo '</div>';
+                    echo '<div style="flex:1;">';
+                    echo '<h3 style="color:#facc15;margin:0;margin-bottom:8px;font-size:1.3em">'.htmlspecialchars($nombre_equipo).'</h3>';
+                    echo '<span style="background:'.$color_estatus.';color:#fff;padding:6px 14px;border-radius:6px;font-size:0.9em;display:inline-block;font-weight:bold">'.htmlspecialchars($estatus).'</span>';
+                    echo '</div>';
+                    echo '</div>';
+                    
+                    // Jugadores por rol
+                    $roles = ['Activo', 'Banca', 'Reserva'];
+                    $hay_jugadores = false;
+                    
+                    foreach ($roles as $rol) {
+                        $sql_jugadores = "
+                            SELECT u.id_usuario, u.nombre, u.foto_perfil, ie.rol_en_equipo
+                            FROM usuarios u
+                            JOIN integrantes_equipos ie ON u.id_usuario = ie.id_usuario
+                            WHERE ie.id_equipo = $id_equipo AND ie.rol_en_equipo = '$rol'
+                            ORDER BY u.nombre
+                        ";
+                        $res_jug = safe_query($conn, $sql_jugadores);
+                        
+                        if ($res_jug && mysqli_num_rows($res_jug) > 0) {
+                            $hay_jugadores = true;
+                            echo '<div style="margin-bottom:20px">';
+                            echo '<div style="color:#facc15;font-weight:bold;margin-bottom:12px;font-size:1.05em;padding-bottom:8px;border-bottom:1px solid #334155">📋 ' . htmlspecialchars($rol) . '</div>';
+                            echo '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:12px;">';
+                            
+                            while ($jug = mysqli_fetch_assoc($res_jug)) {
+                                $foto_jug = obtenerRutaImagen($jug['foto_perfil']);
+                                $badge_class = 'badge-' . strtolower($rol);
+                                echo '<div class="team-player-card" style="padding:14px;background:rgba(59,130,246,0.12);border:2px solid #3b82f6">';
+                                echo '<img src="'.htmlspecialchars($foto_jug).'" alt="'.$jug['nombre'].'" onerror="this.src=\'imagenes/default_user.png\'" style="width:70px;height:70px;border-radius:50%;object-fit:cover;border:2px solid #3b82f6;margin-bottom:10px;display:block;margin-left:auto;margin-right:auto">';
+                                echo '<div style="color:#f1f5f9;font-size:0.95em;font-weight:600;margin-bottom:8px;word-wrap:break-word">'.htmlspecialchars($jug['nombre']).'</div>';
+                                echo '<span class="player-badge '.$badge_class.'" style="padding:6px 10px;font-size:0.85em">'.htmlspecialchars($jug['rol_en_equipo']).'</span>';
+                                echo '</div>';
+                            }
+                            
+                            echo '</div>';
+                            echo '</div>';
+                        }
+                    }
+                    
+                    if (!$hay_jugadores) {
+                        echo '<p style="color:#94a3b8;text-align:center;padding:30px 0;font-style:italic">⚠️ Sin jugadores asignados</p>';
+                    }
+                    
+                    echo '</div>';
+                }
+            } else {
+                echo '<p style="color:#94a3b8;margin-top:16px">No hay equipos registrados.</p>';
+            }
+            ?>
+        </div>
+
+    <?php endif; ?>
+
+    <!-- ========== R3: TABLA COMPETENCIA ========== -->
+    <?php if ($vista == 'r3_competencia'): ?>
+        <div class="card">
+            <h2>⚔️ TABLA DE POSICIONES</h2>
+            <?php
+            $tabla = safe_query($conn, "
+                SELECT 
+                    e.id,
+                    e.nombre,
+                    e.logo,
+                    COUNT(DISTINCT CASE WHEN (m.id_ganador = e.id AND m.estatus_resultado != 'Empate') THEN m.id END) as victorias,
+                    COUNT(DISTINCT CASE WHEN m.estatus_resultado = 'Empate' AND (m.id_equipo_1 = e.id OR m.id_equipo_2 = e.id) THEN m.id END) as empates,
+                    COUNT(DISTINCT CASE WHEN m.id_perdedor = e.id THEN m.id END) as derrotas,
+                    SUM(CASE WHEN m.id_equipo_1 = e.id THEN m.puntos_equipo_1 WHEN m.id_equipo_2 = e.id THEN m.puntos_equipo_2 ELSE 0 END) as puntos_a_favor,
+                    SUM(CASE WHEN m.id_equipo_1 = e.id THEN m.puntos_equipo_2 WHEN m.id_equipo_2 = e.id THEN m.puntos_equipo_1 ELSE 0 END) as puntos_en_contra,
+                    COALESCE(e.puntos_extra, 0) as puntos_extra,
+                    e.estatus
+                FROM equipos e
+                LEFT JOIN matches m ON (e.id = m.id_equipo_1 OR e.id = m.id_equipo_2)
+                GROUP BY e.id, e.nombre, e.logo, e.puntos_extra, e.estatus
+                ORDER BY (COUNT(DISTINCT CASE WHEN m.id_ganador = e.id AND m.estatus_resultado != 'Empate' THEN m.id END) * 3 + COUNT(DISTINCT CASE WHEN m.estatus_resultado = 'Empate' AND (m.id_equipo_1 = e.id OR m.id_equipo_2 = e.id) THEN m.id END) + COALESCE(e.puntos_extra, 0)) DESC
+            ");
+            
+            if ($tabla && mysqli_num_rows($tabla) > 0) {
+                echo '<table><thead><tr><th>#</th><th>Equipo</th><th>PJ</th><th>V</th><th>E</th><th>D</th><th>GF</th><th>GC</th><th>Dif</th><th>Pts Extra</th><th>Total</th><th>Estado</th></tr></thead><tbody>';
+                
+                $pos = 1;
+                while ($fila = mysqli_fetch_assoc($tabla)) {
+                    $pj = intval($fila['victorias']) + intval($fila['empates']) + intval($fila['derrotas']);
+                    $gf = intval($fila['puntos_a_favor']);
+                    $gc = intval($fila['puntos_en_contra']);
+                    $dif = $gf - $gc;
+                    $pts_extra = intval($fila['puntos_extra']);
+                    $total = (intval($fila['victorias']) * 3) + intval($fila['empates']) + $pts_extra;
+                    $color_estado = ($fila['estatus'] == 'Baneado') ? '#ef4444' : '#10b981';
+                    
+                    echo '<tr>';
+                    echo '<td style="font-weight:bold;color:#facc15">' . $pos . '</td>';
+                    echo '<td>' . htmlspecialchars($fila['nombre']) . '</td>';
+                    echo '<td>' . $pj . '</td>';
+                    echo '<td style="color:#10b981;font-weight:bold">' . intval($fila['victorias']) . '</td>';
+                    echo '<td style="color:#f59e0b;font-weight:bold">' . intval($fila['empates']) . '</td>';
+                    echo '<td style="color:#ef4444;font-weight:bold">' . intval($fila['derrotas']) . '</td>';
+                    echo '<td>' . $gf . '</td>';
+                    echo '<td>' . $gc . '</td>';
+                    echo '<td style="color:' . ($dif >= 0 ? '#10b981' : '#ef4444') . ';font-weight:bold">' . ($dif >= 0 ? '+' : '') . $dif . '</td>';
+                    echo '<td>' . $pts_extra . '</td>';
+                    echo '<td style="color:#facc15;font-weight:bold;font-size:1.1em">' . $total . '</td>';
+                    echo '<td><span style="background:' . $color_estado . ';color:#fff;padding:4px 8px;border-radius:4px;font-size:0.85em;display:inline-block">' . htmlspecialchars($fila['estatus']) . '</span></td>';
+                    echo '</tr>';
+                    
+                    $pos++;
+                }
+                
+                echo '</tbody></table>';
+            } else {
+                echo '<p style="color:#94a3b8;margin-top:16px">Aún no hay partidos registrados.</p>';
+            }
+            ?>
+        </div>
+
+    <?php endif; ?>
+
+    <!-- ========== VER MATCHES ========== -->
+    <?php if ($vista == 'ver_matches'): ?>
+        <div class="card">
+            <h2>📊 RESULTADOS DE PARTIDOS</h2>
+            <?php
+            $matches = safe_query($conn, "
+                SELECT 
+                    m.id,
+                    e1.nombre as eq1_nombre,
+                    e2.nombre as eq2_nombre,
+                    m.puntos_equipo_1,
+                    m.puntos_equipo_2,
+                    m.estatus_resultado,
+                    m.motivo_resultado,
+                    m.fecha,
+                    u.nombre as juez_nombre
+                FROM matches m
+                JOIN equipos e1 ON m.id_equipo_1 = e1.id
+                JOIN equipos e2 ON m.id_equipo_2 = e2.id
+                LEFT JOIN usuarios u ON m.id_juez = u.id_usuario
+                ORDER BY m.fecha DESC
+            ");
+            
+            if ($matches && mysqli_num_rows($matches) > 0) {
+                while ($match = mysqli_fetch_assoc($matches)) {
+                    $p1 = intval($match['puntos_equipo_1']);
+                    $p2 = intval($match['puntos_equipo_2']);
+                    $ganador = ($p1 > $p2) ? $match['eq1_nombre'] : (($p2 > $p1) ? $match['eq2_nombre'] : 'Empate');
+                    
+                    echo '<div class="match-card">';
+                    echo '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">';
+                    echo '<div style="flex:1;text-align:left">';
+                    echo '<div style="color:#facc15;font-weight:bold">' . htmlspecialchars($match['eq1_nombre']) . '</div>';
+                    echo '<div style="font-size:1.8em;font-weight:bold;color:#3b82f6">' . $p1 . '</div>';
+                    echo '</div>';
+                    echo '<div style="text-align:center;color:#94a3b8">VS</div>';
+                    echo '<div style="flex:1;text-align:right">';
+                    echo '<div style="color:#facc15;font-weight:bold">' . htmlspecialchars($match['eq2_nombre']) . '</div>';
+                    echo '<div style="font-size:1.8em;font-weight:bold;color:#3b82f6">' . $p2 . '</div>';
+                    echo '</div>';
+                    echo '</div>';
+                    echo '<div style="border-top:1px solid #334155;padding-top:8px;color:#94a3b8;font-size:0.9em">';
+                    echo '📅 ' . htmlspecialchars($match['fecha']) . ' | ⚖️ ' . htmlspecialchars($match['juez_nombre'] ?? 'Sistema') . ' | Resultado: ' . htmlspecialchars($match['estatus_resultado']);
+                    if (!empty($match['motivo_resultado'])) {
+                        echo ' | Motivo: ' . htmlspecialchars($match['motivo_resultado']);
+                    }
+                    echo '</div>';
+                    echo '</div>';
+                }
+            } else {
+                echo '<p style="color:#94a3b8;margin-top:16px">No hay partidos registrados.</p>';
+            }
+            ?>
+        </div>
+
+    <?php endif; ?>
+
+    <!-- ========== JUEZ PANEL ========== -->
+    <?php if ($vista == 'juez_panel' && isset($_SESSION['usuario_rol']) && $_SESSION['usuario_rol'] == 'Juez'): ?>
+        <div class="card">
+            <h2>⚖️ PANEL DE ÁRBITRO</h2>
+            
+            <!-- Registrar nuevo match -->
+            <div class="box" style="margin-bottom:20px">
+                <div class="box-title">➕ Registrar Nuevo Encuentro</div>
+                <form method="POST" action="index.php?vista=juez_panel">
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                        <div>
+                            <label style="color:#94a3b8;font-size:0.9em">Equipo 1</label>
+                            <select name="equipo_1" required>
+                                <option value="">Seleccionar equipo...</option>
+                                <?php $eq_res = safe_query($conn, "SELECT id, nombre FROM equipos WHERE estatus='Activo' ORDER BY nombre"); 
+                                while ($eq = mysqli_fetch_assoc($eq_res)) {
+                                    echo '<option value="'.intval($eq['id']).'">'.htmlspecialchars($eq['nombre']).'</option>';
+                                } ?>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="color:#94a3b8;font-size:0.9em">Equipo 2</label>
+                            <select name="equipo_2" required>
+                                <option value="">Seleccionar equipo...</option>
+                                <?php $eq_res = safe_query($conn, "SELECT id, nombre FROM equipos WHERE estatus='Activo' ORDER BY nombre"); 
+                                while ($eq = mysqli_fetch_assoc($eq_res)) {
+                                    echo '<option value="'.intval($eq['id']).'">'.htmlspecialchars($eq['nombre']).'</option>';
+                                } ?>
+                            </select>
+                        </div>
+                        <div>
+                            <label style="color:#94a3b8;font-size:0.9em">Puntos Equipo 1</label>
+                            <input type="number" name="puntos_equipo_1" min="0" value="0" required>
+                        </div>
+                        <div>
+                            <label style="color:#94a3b8;font-size:0.9em">Puntos Equipo 2</label>
+                            <input type="number" name="puntos_equipo_2" min="0" value="0" required>
+                        </div>
+                        <div style="grid-column:1/3">
+                            <label style="color:#94a3b8;font-size:0.9em">Resultado</label>
+                            <select name="resultado_manual">
+                                <option value="auto">Automático (por puntos)</option>
+                                <option value="empate">Empate</option>
+                            </select>
+                        </div>
+                        <div style="grid-column:1/3">
+                            <label style="color:#94a3b8;font-size:0.9em">Motivo (opcional)</label>
+                            <textarea name="motivo_resultado" placeholder="Notas del árbitro..."></textarea>
+                        </div>
+                        <div style="grid-column:1/3">
+                            <button type="submit" name="registrar_match">✅ Registrar Encuentro</button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+
+            <!-- Modificar puntajes -->
+            <div class="box">
+                <div class="box-title">✏️ Modificar Puntajes de Partidos</div>
+                <?php
+                $matches = safe_query($conn, "
+                    SELECT m.id, e1.nombre as eq1, e2.nombre as eq2, m.puntos_equipo_1, m.puntos_equipo_2, m.fecha
+                    FROM matches m
+                    JOIN equipos e1 ON m.id_equipo_1 = e1.id
+                    JOIN equipos e2 ON m.id_equipo_2 = e2.id
+                    ORDER BY m.fecha DESC LIMIT 10
+                ");
+                
+                if ($matches && mysqli_num_rows($matches) > 0) {
+                    while ($m = mysqli_fetch_assoc($matches)) {
+                        echo '<form method="POST" action="index.php?vista=juez_panel" style="margin-bottom:12px;padding:12px;background:rgba(59,130,246,0.1);border-radius:8px;border:1px solid #3b82f6">';
+                        echo '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:8px;align-items:end">';
+                        echo '<div style="color:#f1f5f9"><strong>' . htmlspecialchars($m['eq1']) . '</strong> vs <strong>' . htmlspecialchars($m['eq2']) . '</strong><br><span style="color:#94a3b8;font-size:0.85em">' . htmlspecialchars($m['fecha']) . '</span></div>';
+                        echo '<div><input type="number" name="puntos_mod_1" value="' . intval($m['puntos_equipo_1']) . '" min="0" style="margin:0"></div>';
+                        echo '<div><input type="number" name="puntos_mod_2" value="' . intval($m['puntos_equipo_2']) . '" min="0" style="margin:0"></div>';
+                        echo '<input type="hidden" name="id_match" value="' . intval($m['id']) . '">';
+                        echo '<button type="submit" name="modificar_match" style="margin:0;padding:8px">Actualizar</button>';
+                        echo '</div>';
+                        echo '</form>';
+                    }
+                } else {
+                    echo '<p style="color:#94a3b8">No hay partidos para modificar.</p>';
+                }
+                ?>
+            </div>
+        </div>
+
+    <?php endif; ?>
+
+    <!-- ========== ADMIN PANEL ========== -->
+    <?php if ($vista == 'admin_panel' && isset($_SESSION['usuario_rol']) && $_SESSION['usuario_rol'] == 'Administrador'): ?>
+        <div class="card">
+            <h2>🔧 PANEL DE ADMINISTRACIÓN</h2>
+            
+            <!-- Gestión de Equipos -->
+            <div class="box" style="margin-bottom:20px">
+                <div class="box-title">⚙️ Gestión de Equipos</div>
+                <?php
+                $equipos_admin = safe_query($conn, "SELECT id, nombre, estatus, puntos_extra FROM equipos ORDER BY nombre");
+                if ($equipos_admin && mysqli_num_rows($equipos_admin) > 0) {
+                    while ($eq = mysqli_fetch_assoc($equipos_admin)) {
+                        echo '<form method="POST" action="index.php?vista=admin_panel" style="margin-bottom:12px;padding:12px;background:rgba(59,130,246,0.1);border-radius:8px;border:1px solid #3b82f6">';
+                        echo '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:8px;align-items:end">';
+                        echo '<div style="color:#f1f5f9"><strong>' . htmlspecialchars($eq['nombre']) . '</strong><br><span style="color:#94a3b8;font-size:0.85em">Estado: ' . htmlspecialchars($eq['estatus']) . ' | Pts Extra: ' . intval($eq['puntos_extra']) . '</span></div>';
+                        
+                        echo '<div>';
+                        echo '<label style="color:#94a3b8;font-size:0.8em">Ajustar Puntos</label>';
+                        echo '<input type="number" name="delta_puntos" value="0" min="-100" max="100" style="margin:0">';
+                        echo '</div>';
+                        
+                        echo '<input type="hidden" name="id_equipo_puntos" value="' . intval($eq['id']) . '">';
+                        
+                        if ($eq['estatus'] == 'Activo') {
+                            echo '<button type="submit" name="banear_equipo_admin" style="margin:0;padding:8px;background:linear-gradient(135deg,#ef4444,#f87171)">⛔ Banear</button>';
+                        } else {
+                            echo '<button type="submit" name="desbanear_equipo_admin" style="margin:0;padding:8px;background:linear-gradient(135deg,#10b981,#34d399)">✅ Desbanear</button>';
+                        }
+                        
+                        echo '<button type="submit" name="ajustar_puntos" style="margin:0;padding:8px">Actualizar</button>';
+                        echo '</div>';
+                        echo '</form>';
+                    }
+                }
+                ?>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <!-- ========== ADMIN PAGOS PANEL ========== -->
+    <?php if ($vista == 'admin_pagos' && isset($_SESSION['usuario_rol']) && $_SESSION['usuario_rol'] == 'Administrador'): ?>
+        <div class="card">
+            <h2>💰 GESTIÓN DE PAGOS Y REFERENCIAS BANCARIAS</h2>
+            
+            <!-- Referencia de Pago Global -->
+            <div class="box" style="margin-bottom:20px;background:rgba(16,185,129,0.1);border:2px solid #10b981">
+                <div class="box-title" style="color:#10b981">🔐 REFERENCIA DE PAGO GLOBAL</div>
+                <div style="background:#0f172a;border:2px solid #facc15;border-radius:8px;padding:14px;text-align:center">
+                    <div style="color:#94a3b8;font-size:0.9em;margin-bottom:8px">Referencia a compartir con jugadores:</div>
+                    <div style="color:#facc15;font-weight:bold;font-size:1.2em;font-family:monospace;word-break:break-all;padding:10px;background:rgba(15,23,42,0.8);border-radius:6px;margin:10px 0"><?= htmlspecialchars($REFERENCIA_PAGO) ?></div>
+                    <button onclick="copiarAlPortapapeles('<?= htmlspecialchars($REFERENCIA_PAGO) ?>')" class="copy-btn">📋 Copiar Referencia</button>
+                </div>
+            </div>
+
+            <?php
+            $usuarios_pago = safe_query($conn, "
+                SELECT u.id_usuario, u.nombre, u.correo, u.edad, u.datos_bancarios, u.estatus_pago
+                FROM usuarios 
+                WHERE rol = 'Participante'
+                ORDER BY u.estatus_pago ASC, u.nombre ASC
+            ");
+            
+            if ($usuarios_pago && mysqli_num_rows($usuarios_pago) > 0) {
+                echo '<table><thead><tr><th>ID</th><th>Nombre</th><th>Correo</th><th>Edad</th><th>Referencia Bancaria</th><th>Estado Pago</th><th>Acciones</th></tr></thead><tbody>';
+                
+                while ($usr = mysqli_fetch_assoc($usuarios_pago)) {
+                    $estado_lower = strtolower($usr['estatus_pago']);
+                    $ref_bank = !empty($usr['datos_bancarios']) ? htmlspecialchars($usr['datos_bancarios']) : '<span style="color:#94a3b8">No registrada</span>';
+                    
+                    echo '<tr>';
+                    echo '<td>#' . intval($usr['id_usuario']) . '</td>';
+                    echo '<td>' . htmlspecialchars($usr['nombre']) . '</td>';
+                    echo '<td>' . htmlspecialchars($usr['correo']) . '</td>';
+                    echo '<td>' . intval($usr['edad']) . '</td>';
+                    echo '<td>' . $ref_bank . '</td>';
+                    echo '<td><span class="status-' . $estado_lower . '">' . htmlspecialchars($usr['estatus_pago']) . '</span></td>';
+                    echo '<td>';
+                    
+                    // Botón para editar referencia bancaria
+                    echo '<form method="POST" action="index.php?vista=admin_pagos" style="display:inline;margin-bottom:4px">';
+                    echo '<input type="hidden" name="id_usuario_ref" value="' . intval($usr['id_usuario']) . '">';
+                    echo '<input type="text" name="nueva_ref_bancaria" placeholder="Nueva ref..." value="' . htmlspecialchars($usr['datos_bancarios']) . '" style="width:150px;padding:6px;margin:0;display:inline-block">';
+                    echo '<button type="submit" name="actualizar_ref_bancaria" style="width:auto;padding:6px 10px;background:linear-gradient(135deg,#8b5cf6,#7c3aed);margin:0 2px">📝 Actualizar Ref</button>';
+                    echo '</form>';
+                    
+                    // Botones de pago
+                    if ($usr['estatus_pago'] != 'Aprobado') {
+                        echo '<form method="POST" action="index.php?vista=admin_pagos" style="display:inline">';
+                        echo '<input type="hidden" name="id_usuario_pago" value="' . intval($usr['id_usuario']) . '">';
+                        echo '<button type="submit" name="aprobar_pago" style="width:auto;padding:6px 10px;background:linear-gradient(135deg,#10b981,#34d399);margin:2px">✅ Aprobar</button>';
+                        echo '</form>';
+                    }
+                    
+                    if ($usr['estatus_pago'] != 'Pendiente') {
+                        echo '<form method="POST" action="index.php?vista=admin_pagos" style="display:inline">';
+                        echo '<input type="hidden" name="id_usuario_pago" value="' . intval($usr['id_usuario']) . '">';
+                        echo '<button type="submit" name="rechazar_pago" style="width:auto;padding:6px 10px;background:linear-gradient(135deg,#f59e0b,#fbbf24);margin:2px">❌ Rechazar</button>';
+                        echo '</form>';
+                    }
+                    
+                    echo '</td>';
+                    echo '</tr>';
+                }
+                
+                echo '</tbody></table>';
+            } else {
+                echo '<p style="color:#94a3b8;margin-top:16px">No hay participantes registrados.</p>';
+            }
+            ?>
+        </div>
+
+    <?php endif; ?>
+
+</div>
+
+<script>
+function copiarAlPortapapeles(texto) {
+    if (!texto) {
+        texto = document.querySelector('.payment-ref-code').textContent;
+    }
+    navigator.clipboard.writeText(texto).then(() => {
+        alert('✅ Referencia copiada al portapapeles');
+    }).catch(err => {
+        alert('❌ Error al copiar');
+    });
+}
+</script>
+
+</body>
+</html>
